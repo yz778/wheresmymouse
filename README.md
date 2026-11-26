@@ -63,19 +63,11 @@ Run the regression tests with `bash scripts/test.sh`.
 
 ### GitHub Actions
 
-The macOS workflow runs the regression tests and builds and verifies a universal ZIP on pull requests and pushes to `main`. The ZIP is available as the `macos-release` artifact on the workflow run. Only a push of a matching `v` tag publishes a GitHub Release. No Mac or Apple signing credentials are required to trigger it.
+The macOS workflow runs the regression tests and verifies a universal ZIP on pull requests and pushes to `main`. The ZIP is available as the `macos-release` artifact on each run.
 
-1. Update `CFBundleShortVersionString` (the release version) and increment `CFBundleVersion` (the build number) in `Resources/Info.plist`. Commit and push the change.
-2. Tag that commit with `v` followed by the exact release version. For example, if `CFBundleShortVersionString` is `2.1.1`:
+For a release, update `CFBundleShortVersionString` and increment `CFBundleVersion` in `Resources/Info.plist` in the pull request. Once merged, the workflow publishes the verified ZIP as a GitHub Release with a matching `v` tag, downloads it to compute its SHA-256, and updates the [Homebrew cask](https://github.com/yz778/homebrew-tap/blob/main/Casks/wheresmymouse.rb). Merging without a version bump does not create another release.
 
-   ```sh
-   git tag v2.1.1
-   git push origin v2.1.1
-   ```
-
-3. Check [Actions](https://github.com/yz778/wheresmymouse/actions) for the build and [Releases](https://github.com/yz778/wheresmymouse/releases) for the published ZIP.
-
-To make a new release available through Homebrew, update `version` and `sha256` in the [tap's cask](https://github.com/yz778/homebrew-tap/blob/main/Casks/wheresmymouse.rb) with the release version and the SHA-256 of the published ZIP.
+Publishing uses the app repository's `GITHUB_TOKEN`. The cask update uses `HOMEBREW_TAP_DEPLOY_KEY`, an Actions secret in this repository holding the private half of a write deploy key for `yz778/homebrew-tap` only. If the tap update fails after publishing, re-run the failed workflow job to reuse the published ZIP; don't overwrite the release.
 
 ### Local build
 
