@@ -3,7 +3,6 @@ name: macOS build and release
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -13,6 +12,8 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
+    outputs:
+      version: ${{ steps.package.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,10 +25,6 @@ jobs:
         shell: bash
         run: |
           version=$(plutil -extract CFBundleShortVersionString raw -o - Resources/Info.plist)
-          if [[ $GITHUB_REF_TYPE == tag && $GITHUB_REF_NAME != "v$version" ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME must match v$version from Resources/Info.plist"
-            exit 1
-          fi
           ./scripts/release.sh --current
           archive="build/wheresmymouse-$version-macos-universal.zip"
 
@@ -42,6 +39,7 @@ jobs:
           esac
           codesign --verify --strict "$app"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-release
@@ -51,19 +49,79 @@ jobs:
           overwrite: true
 
   publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
+    concurrency:
+      group: publish-main
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: macos-release
-      - name: Publish the tagged release
+      - name: Publish and checksum the release
+        id: release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
-          version=${GITHUB_REF_NAME#v}
-          gh release create "$GITHUB_REF_NAME" "wheresmymouse-$version-macos-universal.zip" \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "Where's My Mouse $version"
+          tag="v$VERSION"
+          archive="wheresmymouse-$VERSION-macos-universal.zip"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" "$archive" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --generate-notes --title "Where's My Mouse $VERSION"
+          fi
+
+          released_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)
+          if [[ "$released_commit" != "$GITHUB_SHA" ]]; then
+            echo "$tag is already published from another commit; no release version changed."
+            exit 0
+          fi
+
+          if [[ $(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft) != false ]]; then
+            echo "::error::$tag is not a published release"
+            exit 1
+          fi
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --dir "$RUNNER_TEMP"
+          checksum=$(sha256sum "$RUNNER_TEMP/$archive" | cut -d ' ' -f 1)
+          echo "sha256=$checksum" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.release.outputs.sha256 != ''
+        with:
+          repository: yz778/homebrew-tap
+          ref: main
+          path: homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+      - name: Update the Homebrew cask
+        if: steps.release.outputs.sha256 != ''
+        shell: bash
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256: ${{ steps.release.outputs.sha256 }}
+        run: |
+          ruby <<'RUBY'
+          path = 'Casks/wheresmymouse.rb'
+          version = ENV.fetch('VERSION')
+          sha256 = ENV.fetch('SHA256')
+          abort 'Invalid release checksum' unless sha256.match?(/\A[a-f0-9]{64}\z/)
+
+          cask = File.read(path)
+          versions = cask.scan(/^  version "(\d+(?:\.\d+){1,2})"$/).flatten
+          checksums = cask.scan(/^  sha256 "([a-f0-9]{64})"$/).flatten
+          abort 'Expected one version and checksum in the cask' unless versions.one? && checksums.one?
+          if Gem::Version.new(versions.first) <= Gem::Version.new(version)
+            updated = cask.sub(/^  version ".*"$/, %(  version "#{version}"))
+                          .sub(/^  sha256 ".*"$/, %(  sha256 "#{sha256}"))
+            File.write(path, updated) unless updated == cask
+          end
+          RUBY
+          if ! git diff --quiet -- Casks/wheresmymouse.rb; then
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -m "Update wheresmymouse to $VERSION" -- Casks/wheresmymouse.rb
+            git push origin HEAD:main
+          fi
